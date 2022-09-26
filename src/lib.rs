@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use wasmer::{Module, Store, Instance, ImportObject, Function, Value, RuntimeError};
+use wasmer::{Module, Store, Instance, ImportObject, Function, Value};
 
 pub mod macros;
+pub mod asyncify;
 
 struct AsyncifyExports {
   pub asyncify_get_state: Box<Function>,
@@ -11,10 +11,16 @@ struct AsyncifyExports {
   pub asyncify_stop_unwind: Box<Function>,
 }
 
+struct AsyncImportCall {
+  pub function: Function,
+  pub args: Box<[Value]>,
+  pub result: Option<Box<[Value]>>
+}
+
 struct AsyncifyWasmerInstance {
   pub asyncify_exports: AsyncifyExports,
   pub instance: Instance,
-  pub return_value: Option<Box<[Value]>>,
+  pub async_import_call: Option<Box<AsyncImportCall>>,
 }
 
 #[derive(PartialEq)]
@@ -30,7 +36,7 @@ impl AsyncifyWasmerInstance {
     let instance = Instance::new(&module, &import_object).unwrap();
 
     Self {
-      return_value: Option::None,
+      async_import_call: Option::None,
       asyncify_exports: AsyncifyExports {
         asyncify_get_state: Box::new(instance.exports.get_function("asyncify_get_state").unwrap().clone()),
         asyncify_start_unwind: Box::new(instance.exports.get_function("asyncify_start_unwind").unwrap().clone()),
@@ -42,37 +48,54 @@ impl AsyncifyWasmerInstance {
     }
   }
 
-  fn _wrap_exports(&self) -> HashMap<String, impl Fn(&[Value]) -> Box<[Value]> + '_> {
-    let mut aux = HashMap::new();
-    for (name, func) in self.instance.exports.iter().functions() {
-      if !name.starts_with("asyncify_") {
-        let wrapped = | args: &[Value] | {
-          self._assert_none_state();
-    
-          let mut result = func.call(args);
-          
-          while self._get_asyncify_state() == AsyncifyState::Unwinding {
-            self.asyncify_exports.asyncify_stop_unwind.call(&[]).unwrap();
-    
-            // self.return_value = self.return_value;
-            self._assert_none_state();
-            self.asyncify_exports.asyncify_start_rewind.call(
-              // TODO: pass the return value
-              &[]
-            );
-            result = func.call(&[]);
-          }
-    
-          self._assert_none_state();
-    
-          result.unwrap().clone()
-        };
+  fn call_wrapped_import(&mut self, function: &Function, args: &[Value]) -> Option<Box<[Value]>> {
+    if self._get_asyncify_state() == AsyncifyState::Rewinding {
+      self.asyncify_exports.asyncify_stop_rewind.call(&[]).unwrap();
+      let async_import_call = self.async_import_call.as_mut().unwrap();
 
-        aux.insert(name.to_string(), Box::new(wrapped));
-      }
+      return Option::Some(async_import_call.result.as_ref().unwrap().clone());
     }
+
+    // Paso 2: dentro del export, se ejecuta el import. Y llama a start unwind
+    self.asyncify_exports.asyncify_start_unwind.call(&[]).unwrap();
+
+    // Paso se almacena la llamada al actual import, sin ejecutarla.
+    self.async_import_call = Some(Box::new(AsyncImportCall {
+      function: function.clone(),
+      args: args.to_vec().into_boxed_slice(),
+      result: Option::None
+    }));
+
+    Option::None
+  }
+
+  fn call_wrapped_export(&mut self, function: &Function, args: &[Value]) -> Box<[Value]> {
+    self._assert_none_state();
+
+    // Paso 1: llamar al export
+    let mut result = function.call(args).unwrap();
     
-    aux
+    // Paso 4: termina la primera llamada al export, con el import habiendo iniciado el unwind. 
+    while self._get_asyncify_state() == AsyncifyState::Unwinding {
+      // Paso 4 (cont): Se llama a stop unwind
+      self.asyncify_exports.asyncify_stop_unwind.call(&[]).unwrap();
+
+      // Paso 5: se llama al actual async import
+      let async_import_call = self.async_import_call.as_mut().unwrap();
+      let import_result = async_import_call.function.call(&async_import_call.args).unwrap();
+      self.async_import_call.as_mut().unwrap().result = Option::Some(import_result);
+
+      self._assert_none_state();
+      self.asyncify_exports.asyncify_start_rewind.call(
+        // TODO: pass the return value
+        &[]
+      );
+      result = function.call(args).unwrap();
+    }
+
+    self._assert_none_state();
+
+    result
   }
 
   fn _assert_none_state(&self) {
